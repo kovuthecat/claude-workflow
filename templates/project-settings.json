@@ -1,0 +1,87 @@
+{
+  "_comment": "Settings d'un projet en mode VENDORÉ : le workflow (skills, agents, hooks, docs) est copié dans le repo sous .claude/, pas installé à l'exécution depuis une marketplace. Conséquence directe : rien à installer, nulle part — app Desktop, extension VS Code, session cloud et mobile voient le workflow parce qu'il est dans le clone. Plus de `extraKnownMarketplaces`, plus de `enabledPlugins`, plus de hook de bootstrap : ces trois lignes n'existaient que pour rapatrier des fichiers qui sont désormais déjà là. Instancié et tenu à jour par .claude/workflow/bin/sync-workflow.mjs (skills /migrer-projet et /maj-workflow).",
+  "_comment_hooks": "Le câblage vivait dans hooks.json du plugin ; sans plugin, il revient ici. Les chemins passent par $CLAUDE_PROJECT_DIR — jamais de chemin absolu, qui ne survivrait ni à un autre poste ni à une session cloud. Les scripts, eux, résolvent leurs ressources (CLAUDE-BASE.md, plafonds.json) relativement à leur propre emplacement : ils fonctionnent donc à l'identique vendorés ou non.",
+  "_comment_permissions": "permissions.allow = ce qu'une session de plan fait TOUJOURS — lire, éditer, se mettre à jour, committer son travail —, utile aux sous-agents orchestrés (ils héritent de cet environnement, WORKFLOW.md §5b) et aux hooks du workflow. Son absence a déjà fait échouer une session entière sur un refus d'`Edit` (2026-09-09). Les commandes propres au projet (build, tests) s'ajoutent au fil de l'eau sur refus réellement observé, jamais par précaution. Les hooks du workflow s'appliquent par-dessus : `git add` autorisé ici reste refusé en `-A` par pretooluse-git.mjs.",
+  "effortLevel": "medium",
+  "_comment_outputStyle": "Style d'output vendoré dans .claude/output-styles/ : Claude explique ses choix au fil de l'eau et pose les options avant tout arbitrage structurant. Préférence personnelle du mainteneur, pas une règle de workflow — la retirer si tu préfères le style Default, ou la remplacer par un style à toi. Un settings de projet a la priorité sur les préférences utilisateur : cette ligne gagne contre ~/.claude/settings.json.",
+  "outputStyle": "Pedagogue",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/workflow/hooks/sessionstart-contexte.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/workflow/hooks/pretooluse-git.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/workflow/hooks/posttooluse-format.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/workflow/hooks/stop-contexte.mjs\"",
+            "timeout": 20,
+            "statusMessage": "Vérification du contexte…"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit",
+      "Write",
+      "Bash(npm run build:*)",
+      "Bash(npm run test:*)",
+      "Bash(npm run lint:*)",
+      "Bash(npm run typecheck:*)",
+      "Bash(npx vitest:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(node --check:*)",
+      "Bash(mkdir:*)"
+    ],
+    "deny": [
+      "Read(.env*)",
+      "Read(**/*.pem)",
+      "Read(**/secrets/**)"
+    ]
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "_comment": "Câblage des hooks du plugin workflow — seule source du câblage depuis D-P2-3 (le settings.json d'un projet n'en porte plus). SessionStart (injection CLAUDE-BASE + dérive du contexte) · PreToolUse Bash|PowerShell (garde-fous git) · PostToolUse Edit|Write (formatage prettier conditionnel) · Stop (garde-fou de fin de session). Chemins résolus via ${CLAUDE_PLUGIN_ROOT}, portables (cache local ou cloud).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart-contexte.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse-git.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/posttooluse-format.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/stop-contexte.mjs\"",
+            "timeout": 20,
+            "statusMessage": "Vérification du contexte…"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "templates",
+  "description": "Marketplace perso — plugin workflow (skills, hooks, agents) pour les projets perso.",
+  "owner": { "name": "templates" },
+  "plugins": [
+    {
+      "name": "workflow",
+      "source": "./",
+      "description": "Workflow perso : plans multi-sessions, validation N0-N2, contexte plafonné."
+    }
+  ]
+}

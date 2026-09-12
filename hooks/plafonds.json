@@ -1,0 +1,17 @@
+{
+  "_comment": "Plafonds de lignes des fichiers de contexte. Source unique : lue par les hooks ET par la skill /purge-contexte. Dépassement = tâche d'archivage obligatoire avant de continuer.",
+  "plafonds": {
+    "STATUS.md": 80,
+    "TASKS.md": 60,
+    "VALIDATION.md": 60,
+    "DECISIONS.md": 150,
+    "PROJECT_MAP.md": 200,
+    "CLAUDE.md": 200
+  },
+  "fichiersDeSuivi": [
+    "STATUS.md",
+    "TASKS.md",
+    "VALIDATION.md",
+    "DECISIONS.md"
+  ]
+}
