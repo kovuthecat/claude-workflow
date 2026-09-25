@@ -1,0 +1,966 @@
+#!/usr/bin/env node
+// Moteur d'actions d'un plan — contrat C2 complet
+// (docs/decisions/2026-09-17-autonomie-par-defaut-etat-scripte-push-par-session.md). S2 a écrit la
+// moitié « lecture » (l'état) ; S10 ajoute la moitié « décision » (quoi faire ensuite), sur les
+// tables de `plugin/skills/orchestrer-plan/references/remediation.md` reprises telles quelles.
+//
+// POURQUOI CE FICHIER EXISTE
+// Budget, table nature → modèle, dépendances et recoupement par les commits sont déterministes ;
+// les faire suivre en prose par un modèle est la première source d'erreurs d'aiguillage, payées en
+// sessions Opus (P6/S10). Un moteur écrit sur un parseur non éprouvé se débogue deux fois : le
+// parseur d'index (ci-dessous, inchangé depuis S2) reste couvert par des fixtures copiées d'index
+// réels (tests/fixtures/plans/).
+//
+// USAGE
+//   node plugin/bin/prochaine-action.mjs P<n> [--json]        → une action (ce que fait l'orchestrateur)
+//   node plugin/bin/prochaine-action.mjs P<n> --etat [--json] → seulement l'état dérivé (diagnostic)
+//   node .claude/workflow/bin/prochaine-action.mjs P<n> [--json]   (projet vendoré)
+//
+// LECTURE SEULE. L'état se dérive des seuls fichiers commités : la table et l'ordonnancement de
+// `plans/P<n>/index.md`, les lignes mécaniques de `plans/P<n>/S<k>.echec.md`, la première ligne de
+// `plans/P<n>/S<k>.revue.md`, `git log` (repères `Plan: P<n>/S<k>/T<m>`), `.claude/wave.lock`,
+// l'avance/retard sur l'amont. Jamais un état deviné : un index illisible rend une erreur nommée.
+//
+// SORTIE : sans --json, une ligne lisible puis les champs de l'action ; avec --json, l'objet. Code 0
+// si l'index a pu être lu (quel que soit l'état des sessions qu'il décrit), 2 si l'index est
+// illisible ou si le plan est absent.
+//
+// Actions `lancer`, `reprendre`, `enqueter` : chaque session/appel porte `agent: { subagent_type:
+// "session-<effort>", model: "<sonnet|opus|haiku>" }`, prêt à recopier dans un appel `Agent(...)` —
+// jamais une valeur que le modèle transforme lui-même (D2,
+// docs/decisions/2026-09-22-flous-du-workflow.md). Modèle hors Sonnet|Opus|Haiku : pas de champ
+// `agent`, un `avertissement` nommant la valeur.
+//
+// Avant un `lancer` : l'arbre non commité est croisé avec la zone de chaque session de la vague (D1,
+// même décision). Recoupement, zone illisible ou `git status` en échec → `question` source
+// `arbre-sale`, motifs : fichiers touchés dans une zone, « zone illisible : <segment> », « arbre
+// invérifiable ».
+
+import { readFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { join, dirname, basename, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { verifierPreuve } from './preuve-n0.mjs';
+
+const RACINE = process.cwd();
+
+const args = process.argv.slice(2);
+const plan = args.find((a) => /^P\d+$/.test(a));
+const etat = args.includes('--etat');
+const json = args.includes('--json');
+
+if (!plan) {
+  console.error('prochaine-action: indiquer un plan (ex. P6)');
+  process.exit(2);
+}
+
+// ── git, best-effort, jamais bloquant (style maison : plugin/bin/collecter-incidents.mjs) ────────
+function git(...a) {
+  try {
+    return execFileSync('git', a, {
+      cwd: RACINE,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      timeout: 8000,
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Copie de `plugin/hooks/lib.mjs` `racineDepot`/`worktreeLie` (bin/ est vendoré sans hooks/, donc
+// dupliquée, pas importée — les deux logiques doivent être tenues synchronisées à la main). `null`
+// si la racine ne peut pas être établie avec certitude (worktree lié d'un dépôt à `.git` déplacé,
+// sonde du 2026-09-24, plans/P10/S1.md) — jamais une racine devinée.
+function worktreeLie() {
+  const propre = git('rev-parse', '--path-format=absolute', '--git-dir');
+  const commun = git('rev-parse', '--path-format=absolute', '--git-common-dir');
+  return Boolean(propre && commun && resolve(propre) !== resolve(commun));
+}
+
+function racineDepot() {
+  // Pas un dépôt du tout : comportement historique inchangé (rend RACINE) — le cas ambigu que
+  // cette fonction refuse par défaut est un dépôt existant dont la racine ne peut pas être établie,
+  // jamais l'absence de dépôt.
+  if (git('rev-parse', '--is-inside-work-tree') !== 'true') return RACINE;
+  if (!worktreeLie()) {
+    return git('rev-parse', '--path-format=absolute', '--show-toplevel');
+  }
+  const commun = git('rev-parse', '--path-format=absolute', '--git-common-dir');
+  if (!commun) return null;
+  if (basename(commun) === '.git') return dirname(commun);
+  return null; // worktree lié d'un dépôt à `.git` déplacé : `git worktree list` n'y est pas fiable
+}
+
+/** Rebase en cours (fusion ou apply) : jamais résolu depuis un script, toujours une `question`
+ * (T5, P10/S2). `--path-format=absolute` : même convention que `racineDepot`, insensible au cwd. */
+function rebaseEnCours() {
+  for (const nom of ['rebase-merge', 'rebase-apply']) {
+    const chemin = git('rev-parse', '--path-format=absolute', '--git-path', nom);
+    if (chemin && existsSync(chemin)) return true;
+  }
+  return false;
+}
+
+/** Fichiers **suivis** modifiés, jamais les non suivis (`--untracked-files=no`) : un arbre sale au
+ * sens de `pousser` (T5, P10/S2, incident ebm-msp) — distinct de `fichiersSales()` ci-dessous, qui
+ * inclut les non-suivis pour le contrôle de zone avant `lancer` (D1). `null` (git en échec) compte
+ * comme sale : jamais un arbre invérifiable traité comme propre. */
+function arbreTrackedSale() {
+  const sortie = git('status', '--porcelain', '--untracked-files=no');
+  return sortie === null || sortie.length > 0;
+}
+
+function etatAmont() {
+  const amont = git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}');
+  if (!amont) return null;
+  const comptes = git('rev-list', '--left-right', '--count', `${amont}...HEAD`);
+  if (!comptes) return null;
+  const [retard, avance] = comptes.split(/\s+/).map(Number);
+  if (!Number.isFinite(retard) || !Number.isFinite(avance)) return null;
+  return { amont, retard, avance };
+}
+
+// ── Parseur d'index (table + ordonnancement) ──────────────────────────────────────────────────────
+function erreur(motif) {
+  return { erreur: `index illisible : ${motif}` };
+}
+
+/** Minuscules, accents retirés (NFD), backticks/`*` retirés, espaces de bord retirés — la forme sur
+ * laquelle on compare une valeur écrite à la main (nature entre backticks, séparateur inhabituel) à
+ * un mot attendu, sans exiger l'orthographe exacte (T4, P10/S2). */
+function normaliserSimple(s) {
+  return String(s || '')
+    .replace(/[`*]/g, '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+}
+
+function lireIndex(dossierPlan) {
+  const chemin = join(dossierPlan, 'index.md');
+  if (!existsSync(chemin)) return erreur(`${chemin} absent`);
+
+  let texte;
+  try {
+    texte = readFileSync(chemin, 'utf8').replace(/\r\n/g, '\n');
+  } catch (e) {
+    return erreur(`${chemin} : ${e.message}`);
+  }
+  const lignes = texte.split('\n');
+
+  const ligneWorkflow = lignes.find((l) => /^Workflow\s*:/.test(l.trim()));
+  const workflow = ligneWorkflow ? (/Workflow\s*:\s*v?(\S+)/.exec(ligneWorkflow)?.[1] ?? null) : null;
+
+  // Deux lignes facultatives, hors table (T6, P10/S2) : `Remédiation Opus :`, écrite par
+  // l'orchestrateur — survit à la suppression des `.echec.md` au PASS, contrairement à un total
+  // recalculé sur les rapports présents ; `Clos :`, posée par `fin-de-plan.md`.
+  const ligneRemediationOpus = lignes.find((l) => /^Rem[ée]diation\s+Opus\s*:/i.test(l.trim()));
+  const remediationOpus = ligneRemediationOpus
+    ? Number(/:\s*(\d+)/.exec(ligneRemediationOpus)?.[1] ?? 0)
+    : 0;
+  const ligneClos = lignes.find((l) => /^Clos\s*:/.test(l.trim()));
+  const clos = ligneClos ? (/:\s*(\S+)/.exec(ligneClos)?.[1] ?? null) : null;
+
+  // Table des sessions : colonnes fixées par le squelette (nouveau-plan/references/squelette-index.md).
+  const sessions = [];
+  for (const ligneBrute of lignes) {
+    const l = ligneBrute.trim();
+    if (!l.startsWith('|')) continue;
+    const cellules = l.split('|').slice(1, -1).map((c) => c.trim());
+    if (cellules.length < 9) continue;
+    const idSession = /\bS(\d+)\b/.exec(cellules[0]);
+    if (!idSession) continue; // en-tête ou ligne de séparateur (---)
+    const statut = /\[( |x)\](!)?/.exec(cellules[8]);
+    sessions.push({
+      session: `S${idSession[1]}`,
+      taches: cellules[1],
+      titre: cellules[2],
+      modele: cellules[3],
+      effort: cellules[4].replace(/[`*]/g, '').trim().toLowerCase(),
+      env: cellules[5],
+      dependDe: cellules[6],
+      zone: cellules[7],
+      statutBrut: cellules[8],
+      coche: statut ? statut[1] === 'x' : false,
+      bloquantNonTrie: statut ? Boolean(statut[2]) : false,
+      pastille: false, // complété plus bas, depuis l'ordonnancement
+    });
+  }
+  if (sessions.length === 0) return erreur(`aucune session reconnue dans la table (${chemin})`);
+
+  // Ordonnancement : vagues (numéro, label, sessions membres) + marqueur `pastille` par session.
+  const vagues = [];
+  let dansOrdonnancement = false;
+  for (const ligneBrute of lignes) {
+    const l = ligneBrute.trim();
+    if (/^##\s+Ordonnancement/.test(l)) {
+      dansOrdonnancement = true;
+      continue;
+    }
+    if (dansOrdonnancement && /^##\s+/.test(l)) {
+      dansOrdonnancement = false;
+      continue;
+    }
+    if (!dansOrdonnancement) continue;
+
+    // Tiret initial facultatif, parenthèse facultative entre `**` et `:` (ancien format de la ligne
+    // d'extension — incident MYO du 2026-09-22 : une vague jamais lancée faute de tiret ou de
+    // ponctuation au bon endroit, T4/P10/S2).
+    const enteteVague = /^(?:-\s*)?\*\*Vague\s+(\d+)(?:\s*—\s*([^*]+?))?\*\*\s*(?:\([^)]*\)\s*)?:\s*(.+)$/.exec(l);
+    if (enteteVague) {
+      const labelBrut = enteteVague[2] ? enteteVague[2].trim() : null;
+      const labelNormalise = (labelBrut || '').toLowerCase();
+      // Toutes les parenthèses retirées avant de chercher les membres `S\d+` — sinon un membre après
+      // la première parenthèse (date d'ajout, commentaire) est perdu (constat 2026-09-24).
+      const membres = enteteVague[3].replace(/\([^)]*\)/g, '');
+      vagues.push({
+        numero: Number(enteteVague[1]),
+        label: labelBrut,
+        parallelisable: labelNormalise.includes('parallélisable'),
+        validationHumaine: labelNormalise.includes('validation-humaine'),
+        repriseManuelle: labelNormalise.includes('reprise-manuelle'),
+        cloture: labelNormalise.includes('clôture'),
+        // « validée » (accents/casse libres) acquitte explicitement une validation-humaine (T5, P10/S2).
+        validee: normaliserSimple(labelBrut || '').includes('validee'),
+        gateLegacy: labelNormalise.includes('gate'), // ancien mot : signalé, jamais interprété
+        sessions: [...membres.matchAll(/S\d+/g)].map((m) => m[0]),
+      });
+      continue;
+    }
+
+    // Ligne « en clair » d'une session : `  - **S<k>** — <texte>`. Seul le mot `pastille` y compte ici.
+    const sousLigne = /^-\s*\*\*(S\d+)\*\*\s*[—-]\s*(.*)$/.exec(l);
+    if (sousLigne && /\bpastille\b/.test(sousLigne[2])) {
+      const s = sessions.find((x) => x.session === sousLigne[1]);
+      if (s) s.pastille = true;
+    }
+  }
+  if (vagues.length === 0) return erreur(`aucune vague reconnue sous « ## Ordonnancement » (${chemin})`);
+
+  return { workflow, sessions, vagues, remediationOpus, clos, preuveN0: /^Preuve N0\s*:\s*requise\s*$/m.test(texte) };
+}
+
+// ── Tâches d'une session, commitées ou non ────────────────────────────────────────────────────────
+function parseTaches(champ) {
+  const nums = new Set();
+  for (const morceau of String(champ || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const m = /^T(\d+)(?:-T(\d+))?$/.exec(morceau);
+    if (!m) continue;
+    const debut = Number(m[1]);
+    const fin = m[2] ? Number(m[2]) : debut;
+    for (let i = debut; i <= fin; i++) nums.add(i);
+  }
+  return [...nums].sort((a, b) => a - b);
+}
+
+function refsCommitees() {
+  const messages = git('log', '--format=%B') || '';
+  const refs = new Set();
+  for (const m of messages.matchAll(/Plan:\s*(P\d+)\/(S\d+)\/(T\d+)/g)) {
+    refs.add(`${m[1]}/${m[2]}/${m[3]}`);
+  }
+  return refs;
+}
+
+/** Un fichier **ajouté** par un commit, même s'il a été supprimé depuis (T6, P10/S2) — évite qu'une
+ * revue déposée puis rangée au tri de clôture ne relance `relire` (constat 2026-09-24, même technique
+ * que `plugin/hooks/lib.mjs` `revuesManquantes` : `git log --diff-filter=A`). `chemin` relatif à la
+ * racine du dépôt (git tourne avec `cwd: RACINE`). */
+function ajouteParUnCommit(chemin) {
+  const sortie = git('log', '--diff-filter=A', '--format=%H', '--', chemin);
+  return Boolean(sortie);
+}
+
+// ── `.echec.md` : les lignes mécaniques, défauts du gabarit quand une ligne manque ───────────────────
+// (plugin/skills/reprendre-echec/SKILL.md, section « Gabarit »). Cinq mots de nature reconnus (T4,
+// P10/S2) : `environnement`, `exécution`, `prémisse`, `filtre`, `interruption` — les deux derniers
+// n'ont pas encore de traitement particulier ici (T5), mais une valeur non reconnue est déjà
+// signalée plutôt que silencieusement absorbée.
+const NATURES_VALIDES = ['environnement', 'exécution', 'prémisse', 'filtre', 'interruption'];
+const NATURES_PAR_FORME_SIMPLE = Object.fromEntries(NATURES_VALIDES.map((n) => [normaliserSimple(n), n]));
+// « premisse » et « execution » (sans accent) sont les fautes de frappe attendues.
+NATURES_PAR_FORME_SIMPLE.premisse = 'prémisse';
+NATURES_PAR_FORME_SIMPLE.execution = 'exécution';
+
+/** `{ nature, inconnue }` — `nature` retombe sur `exécution` (défaut documenté) que la valeur brute
+ * soit absente ou non reconnue ; `inconnue` porte la valeur brute **seulement** quand elle était
+ * présente et non reconnue (jamais sur une ligne absente) — c'est ce qui distingue un défaut
+ * silencieux d'une valeur à questionner (T4, P10/S2). */
+function normaliserNature(brut) {
+  if (!brut) return { nature: 'exécution', inconnue: null };
+  const simple = normaliserSimple(brut);
+  const trouvee = NATURES_PAR_FORME_SIMPLE[simple];
+  if (trouvee) return { nature: trouvee, inconnue: null };
+  return { nature: 'exécution', inconnue: brut };
+}
+
+function lireEchec(chemin) {
+  const texte = readFileSync(chemin, 'utf8');
+  const valeur = (nom) => {
+    const m = new RegExp(`^${nom}\\s*:\\s*(.*)$`, 'mi').exec(texte);
+    return m ? m[1].trim() : null;
+  };
+
+  const { nature, inconnue: natureInconnue } = normaliserNature(valeur('Nature'));
+
+  // Reprises et enquêtes lues séparément : un séparateur inhabituel entre les deux (« · » au lieu
+  // d'un espace, constat 2026-09-24 : « reprise=1 · enquete=0 » lu 0/0) ne doit plus faire perdre
+  // l'un ou l'autre compte.
+  const tentativesBrut = valeur('Tentatives');
+  const repriseM = tentativesBrut && /reprise\s*=\s*(\d+)/i.exec(tentativesBrut);
+  const enqueteM = tentativesBrut && /enqu[eê]te\s*=\s*(\d+)/i.exec(tentativesBrut);
+  const tentatives = {
+    reprise: repriseM ? Number(repriseM[1]) : 0,
+    enquete: enqueteM ? Number(enqueteM[1]) : 0,
+  };
+
+  const blocage = valeur('Blocage'); // absente ⇒ démarrage à froid (pas de canal court)
+  const mesure = valeur('Mesure'); // optionnelle : seulement une prémisse mesurée et commitée
+
+  // Auto : oui, suivi d'un séparateur quelconque (·, -, ,, espace) puis `option <m>`. Un « oui » sans
+  // numéro d'option vaut « non », avec un avertissement (T4, P10/S2) — jamais un `reprendre` sur une
+  // option qui n'existe pas.
+  const autoBrut = valeur('Auto');
+  let auto = 'non';
+  let avertissementAuto = null;
+  if (autoBrut) {
+    const simple = autoBrut.replace(/[`*]/g, '').trim();
+    if (/^oui/i.test(simple)) {
+      const m = /^oui[\s·\-,]*option\s*(\d+)/i.exec(simple);
+      if (m) {
+        auto = `oui · option ${m[1]}`;
+      } else {
+        avertissementAuto = 'Auto : oui sans option — ignoré';
+      }
+    }
+  }
+
+  // Une prémisse réfutée par `verificateur-premisse` (§9c) : l'orchestrateur ajoute cette ligne au
+  // rapport avant de rappeler le script (T5, P10/S2) — casse et accents libres.
+  const premisseBrut = valeur('Premisse');
+  const premisseRefutee = premisseBrut ? normaliserSimple(premisseBrut).startsWith('refutee') : false;
+
+  return {
+    nature,
+    natureInconnue,
+    tentatives,
+    blocage,
+    mesure,
+    auto,
+    avertissementAuto,
+    premisseRefutee,
+    demarrageAFroid: !blocage,
+  };
+}
+
+function lireRevue(chemin, texte = readFileSync(chemin, 'utf8')) {
+  const m = /^Bloquant\s*:\s*(\d+)/m.exec(texte);
+  const couverture = /^Couverture\s*:\s*(.+)$/m.exec(texte)?.[1].trim();
+  const reprises = Number(/^Reprises\s*:\s*(\d+)$/m.exec(texte)?.[1] ?? 0);
+  const dependances = /^Dépendances\s*:\s*(.+)$/m.exec(texte)?.[1].trim();
+  return { bloquant: m ? Number(m[1]) : null,
+    couverture: m ? (couverture ?? 'complète') : 'invalide', // anciennes revues : pas de champ Couverture
+    reprises, dependances: dependances === 'libres' ? 'libres' : 'bloquées' };
+}
+
+// ── Moteur (S10) — table « la nature décide » de remediation.md, reprise telle quelle ────────────────
+// Budget (WORKFLOW.md §9c) : 2 reprises + 1 enquête par session, 2 enquêtes par plan. Vit dans les
+// lignes mécaniques d'un .echec.md (survit à une orchestration interrompue) ; le total « par plan »
+// se dérive en sommant les sessions actuellement en échec de ce plan — un .echec.md disparaît au
+// PASS (reprendre-echec Étape 5), donc c'est tout ce que les fichiers commités peuvent encore dire.
+
+const UN_CRAN_AU_DESSUS = { Haiku: 'Sonnet', Sonnet: 'Opus' };
+
+// Effort lançable depuis un index (T2, P7/S2) — `max` en est exclu à dessein : WORKFLOW.md §3 le
+// réserve à `/effort max` en session, jamais à une colonne d'index (décision 2026-09-18).
+const EFFORTS_LANCABLES = ['low', 'medium', 'high', 'xhigh'];
+
+// ── D2 : appel d'agent prêt à recopier — le script rend `subagent_type` et `model` (minuscules),
+// jamais une valeur que l'orchestrateur transforme à la main (docs/decisions/2026-09-22-…, table
+// modèle → effort reprise de `references/remediation.md` l. 11-15, désormais portée ici). ──────────
+const MODELES_VALIDES = ['Sonnet', 'Opus', 'Haiku'];
+const EFFORT_DU_MODELE = { Opus: 'high', Sonnet: 'medium', Haiku: 'low' };
+
+/** `{ subagent_type, model }` prêt à recopier dans un appel `Agent(...)`, ou `null` si le modèle est
+ * hors Sonnet|Opus|Haiku — jamais un `subagent_type` inventé. */
+function appelAgent(modele, effort) {
+  if (!MODELES_VALIDES.includes(modele)) return null;
+  return { subagent_type: `session-${effort}`, model: modele.toLowerCase() };
+}
+
+/** `{ agent }` à étaler sur une session/action, ou `{ avertissement }` nommant la valeur si le
+ * modèle est inconnu — jamais les deux, jamais un `agent` deviné. */
+function champAgent(modele, effort) {
+  const agent = appelAgent(modele, effort);
+  if (agent) return { agent };
+  return {
+    avertissement: `modèle inconnu ("${modele}") : pas d'appel d'agent composé (Sonnet, Opus ou Haiku attendus)`,
+  };
+}
+
+// ── D1 : arrêt sur arbre sale dans la zone d'une vague — croisement mécanique fait par le script,
+// jamais délégué (docs/decisions/2026-09-22-…). ──────────────────────────────────────────────────
+/** Chemins d'une zone = seuls les segments entre backticks de la cellule « Zone modifiée » ; le texte
+ * hors backticks ( `(§9a, §9c)`, `(4 fichiers créés)`, `(nouveau)` ) est ignoré. Accolades développées
+ * avant comparaison. Segment avec `*`/`**` ou accolades non appariées → zone illisible. */
+function cheminsDeZone(cellule) {
+  const segments = [...String(cellule || '').matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+  const chemins = [];
+  for (const seg of segments) {
+    const ouvrantes = (seg.match(/\{/g) || []).length;
+    const fermantes = (seg.match(/\}/g) || []).length;
+    if (seg.includes('*') || ouvrantes !== fermantes) {
+      return { chemins: [], illisible: seg };
+    }
+    if (ouvrantes === 0) {
+      chemins.push(seg);
+      continue;
+    }
+    const m = /^(.*)\{([^{}]*)\}(.*)$/.exec(seg);
+    if (!m) return { chemins: [], illisible: seg };
+    const [, prefixe, options, suffixe] = m;
+    for (const option of options.split(',')) chemins.push(`${prefixe}${option.trim()}${suffixe}`);
+  }
+  return { chemins, illisible: null };
+}
+
+/** Chemins bruts depuis `git status --porcelain -z --untracked-files=all` : pas de guillemets, pas de
+ * repli `?? dossier/` (chaque fichier d'un dossier non suivi compte individuellement, D1). `null` si
+ * `git` échoue — jamais un arbre deviné. Renommage/copie (code X ou Y = R/C) : le chemin d'origine
+ * (champ `-z` suivant) compte aussi. */
+function fichiersSales() {
+  const sortie = git('status', '--porcelain', '-z', '--untracked-files=all');
+  if (sortie === null) return null;
+  const bruts = sortie.split('\0').filter((s) => s.length > 0);
+  const fichiers = [];
+  for (let i = 0; i < bruts.length; i++) {
+    const entree = bruts[i];
+    fichiers.push(entree.slice(3));
+    if (entree[0] === 'R' || entree[0] === 'C') {
+      i++;
+      if (i < bruts.length) fichiers.push(bruts[i]);
+    }
+  }
+  return fichiers;
+}
+
+/** Segment terminé par `/` = dossier → préfixe ; sinon égalité de chemin (D1). */
+function cheminToucheZone(chemin, zoneChemin) {
+  return zoneChemin.endsWith('/') ? chemin.startsWith(zoneChemin) : chemin === zoneChemin;
+}
+
+/** Avant un `lancer` : croise l'arbre non commité avec la zone de chaque session à lancer. `null` si
+ * rien à signaler (l'appelant rend `lancer`) ; sinon la `question` à rendre à sa place. */
+function arreteSurArbreSale(aLancer, plan) {
+  const sales = fichiersSales();
+  if (sales === null) {
+    return {
+      action: 'question',
+      motif: 'arbre invérifiable : `git status` a échoué',
+      options: { source: 'arbre-sale', motif: 'arbre-inverifiable' },
+    };
+  }
+  const prefixePlan = `plans/${plan}/`;
+  for (const s of aLancer) {
+    const { chemins, illisible } = cheminsDeZone(s.zone);
+    if (illisible) {
+      return {
+        action: 'question',
+        motif: `zone illisible : ${illisible} (${s.session})`,
+        options: { source: 'arbre-sale', session: s.session, segment: illisible },
+      };
+    }
+    if (chemins.length === 0) continue; // zone `aucune` (ou vide) : aucun contrôle pour elle
+    // Fichiers du plan en cours ignorés, sauf s'ils sont nommés par cette zone (D1).
+    const candidats = sales.filter((f) => !f.startsWith(prefixePlan) || chemins.includes(f));
+    const touches = candidats.filter((f) => chemins.some((c) => cheminToucheZone(f, c)));
+    if (touches.length > 0) {
+      return {
+        action: 'question',
+        motif: `arbre sale dans la zone de ${s.session} : ${touches.join(', ')}`,
+        options: { source: 'arbre-sale', session: s.session, fichiers: touches },
+      };
+    }
+  }
+  return null;
+}
+
+function questionBudget(session, nature = 'reprise') {
+  const mot = nature === 'enquete' ? "d'enquête" : 'de reprises';
+  return {
+    action: 'question',
+    motif: `budget ${mot} épuisé sur ${session.session}`,
+    options: { source: 'budget-epuise', session: session.session },
+  };
+}
+
+/** Une session à lancer porte un effort non lançable — refuser en nommant §3 plutôt que propager
+ * un `subagent_type` inexistant (T2, P7/S2). */
+function questionEffortInvalide(session) {
+  if (session.effort === 'max') {
+    return {
+      action: 'question',
+      motif:
+        `${session.session} porte l'effort "max" : non réglable depuis un index ` +
+        `(WORKFLOW.md §3, \`/effort max\` en session seulement)`,
+      options: { source: 'effort-invalide', session: session.session, effort: session.effort },
+    };
+  }
+  return {
+    action: 'question',
+    motif: `${session.session} porte un effort inconnu ("${session.effort}") — valeurs acceptées : ${EFFORTS_LANCABLES.join(', ')}`,
+    options: { source: 'effort-invalide', session: session.session, effort: session.effort },
+  };
+}
+
+function questionNatureInconnue(session, valeur) {
+  return {
+    action: 'question',
+    motif: `${session.session} : \`Nature :\` non reconnue ("${valeur}") — environnement, exécution, prémisse, filtre ou interruption attendus`,
+    options: { source: 'nature-inconnue', session: session.session, valeur },
+  };
+}
+
+function questionBudgetOpus(session) {
+  return {
+    action: 'question',
+    motif: `remédiation Opus déjà consommée sur ce plan : budget épuisé pour ${session.session}`,
+    options: { source: 'budget-opus', session: session.session },
+  };
+}
+
+/** Décision pour UNE session en échec (table « la nature décide », remediation.md).
+ * `remediationOpusDeja` : la ligne `Remédiation Opus :` de l'index (T6, P10/S2) — au plus une passe
+ * Opus (reprise ou enquête, session Opus comprise) par plan. */
+function remedier(session, enqueteTotalPlan, remediationOpusDeja) {
+  const e = session.echec;
+  const modeleIndex = session.modele;
+
+  // Valeur de `Nature :` présente mais non reconnue → question avant tout diagnostic (T4, P10/S2).
+  if (e.natureInconnue) return questionNatureInconnue(session, e.natureInconnue);
+
+  // Filtre de contenu : nature à part, jamais reprise à l'identique (§9a) — toujours une question,
+  // même devant un `Auto : oui · option <m>` déjà posé (T5, P10/S2).
+  if (e.nature === 'filtre') {
+    return {
+      action: 'question',
+      motif: `filtre de contenu sur ${session.session} : jamais repris à l'identique`,
+      options: { source: 'filtre', session: session.session },
+    };
+  }
+
+  // `Auto : oui · option <m>` — remède déjà connu, prioritaire sur la nature (C5, WORKFLOW.md §9c).
+  const auto = e.auto && /^oui\s*·\s*option\s*(\d+)/i.exec(e.auto);
+  if (auto) {
+    if (e.tentatives.reprise >= 2) return questionBudget(session);
+    return { action: 'reprendre', session: session.session, modele: modeleIndex, option: Number(auto[1]) };
+  }
+
+  // Une prémisse réfutée par `verificateur-premisse` (l'orchestrateur a ajouté `Premisse : refutee`
+  // au rapport avant de rappeler le script, T5/P10/S2) suit désormais la branche `exécution` : la
+  // vraie cause est ailleurs que là où la session l'a cherchée.
+  const nature = e.nature === 'prémisse' && e.premisseRefutee ? 'exécution' : e.nature;
+
+  if (nature === 'prémisse') {
+    if (e.mesure) {
+      const commit = /^(\S+)/.exec(e.mesure)?.[1];
+      const existe = commit ? git('cat-file', '-e', commit) !== null : false;
+      if (existe) {
+        return {
+          action: 'question',
+          motif: `prémisse prouvée par une mesure commitée sur ${session.session} (${commit})`,
+          options: { source: 'etape6', cas: 'premisse-confirmee' },
+        };
+      }
+      // Commit cité introuvable : la mesure ne prouve plus rien, retomber sur « sans Mesure ».
+    }
+    // Chemin complété par l'appelant (prochaineAction), qui seul connaît le plan.
+    return { action: 'verifier-premisse', session: session.session };
+  }
+
+  if (nature === 'environnement') {
+    if (e.tentatives.reprise >= 2) return questionBudget(session);
+    return { action: 'reprendre', session: session.session, modele: modeleIndex };
+  }
+
+  // `exécution`, prémisse réfutée, ou nature absente (défaut du parseur d'échec — reprendre-echec/
+  // SKILL.md « Gabarit »). Décision du 2026-09-24, points 4 et 6 : la 1re reprise tourne sur le
+  // modèle de l'index, la 2e un cran au-dessus ; au plus une passe Opus de remédiation par plan
+  // (T6, P10/S2).
+  let modeleCible;
+  let typeAction;
+  if (modeleIndex === 'Opus') {
+    if (e.blocage) {
+      if (e.tentatives.reprise >= 2) return questionBudget(session);
+      modeleCible = 'Opus';
+      typeAction = 'reprendre';
+    } else {
+      if (e.tentatives.enquete >= 1 || enqueteTotalPlan >= 2) return questionBudget(session, 'enquete');
+      modeleCible = 'Opus';
+      typeAction = 'enqueter';
+    }
+  } else {
+    if (e.tentatives.reprise >= 2) return questionBudget(session);
+    modeleCible = e.tentatives.reprise >= 1 ? (UN_CRAN_AU_DESSUS[modeleIndex] ?? 'Sonnet') : modeleIndex;
+    typeAction = 'reprendre';
+  }
+
+  if (modeleCible === 'Opus' && remediationOpusDeja >= 1) return questionBudgetOpus(session);
+  return { action: typeAction, session: session.session, modele: modeleCible };
+}
+
+/** Une action parmi celles de C2, dérivée de l'état déjà assemblé (`sortie`). Ordre des tests (T5,
+ * P10/S2, incident ebm-msp 2026-09-24) : rebase, verrou, interruption, `pousser` (arbre propre
+ * seulement), le reste inchangé. */
+function prochaineAction(sortie) {
+  if (sortie.depot.rebase) {
+    return {
+      action: 'question',
+      motif: 'rebase en cours : le résoudre avant de reprendre le plan',
+      options: { source: 'rebase' },
+    };
+  }
+
+  if (sortie.depot.waveLock) {
+    return {
+      action: 'question',
+      motif: 'vague interrompue sous verrou : diff non commité dans l\'arbre',
+      options: { source: 'wave-lock' },
+    };
+  }
+
+  const vagues = [...sortie.vagues].sort((a, b) => a.numero - b.numero);
+
+  // Une session interrompue par quota (nature `interruption`) se relance avant tout `pousser`, et
+  // ne consomme aucune reprise du budget (décision 2026-09-24, point 7).
+  for (const vague of vagues) {
+    const membres = vague.sessions.map((id) => sortie.sessions.find((s) => s.session === id)).filter(Boolean);
+    const interrompue = membres.find((s) => s.etat === 'echec' && s.echec?.nature === 'interruption');
+    if (interrompue) {
+      return {
+        action: 'relancer-interrompue',
+        session: interrompue.session,
+        modele: interrompue.modele,
+        ...champAgent(interrompue.modele, EFFORT_DU_MODELE[interrompue.modele] ?? interrompue.effort),
+      };
+    }
+  }
+
+  if (sortie.depot.amont && sortie.depot.amont.avance > 0) {
+    if (sortie.depot.arbreSale) {
+      return {
+        action: 'question',
+        motif: 'arbre non commité : impossible de pousser sans perdre ou masquer ce diff',
+        options: { source: 'arbre-sale' },
+      };
+    }
+    return { action: 'pousser' };
+  }
+
+  if (sortie.preuveN0 && !sortie.clos) {
+    const invalide = sortie.sessions.find(s => s.etat === 'faite' && !s.preuve?.ok);
+    if (invalide) return { action: 'valider-n0', session: invalide.session,
+      motif: invalide.preuve?.motif ?? 'preuve N0 absente' };
+  }
+  const compromises = (s, visites = new Set()) => {
+    if (visites.has(s.session)) return true;
+    const suivants = new Set([...visites, s.session]);
+    return (s.dependDe.match(/S\d+/g) ?? []).some(id => {
+      const dep = sortie.sessions.find(x => x.session === id);
+      return !dep || dep.etat !== 'faite' ||
+        (dep.revue?.bloquant > 0 && dep.revue.dependances !== 'libres') || compromises(dep, suivants);
+    });
+  };
+  const bloques = [];
+  const enqueteTotalPlan = sortie.sessions
+    .filter((s) => s.etat === 'echec')
+    .reduce((acc, s) => acc + (s.echec?.tentatives.enquete ?? 0), 0);
+
+  for (const vague of vagues) {
+    const membres = vague.sessions
+      .map((id) => sortie.sessions.find((s) => s.session === id))
+      .filter(Boolean);
+
+    const enEchec = membres.find((s) => s.etat === 'echec');
+    if (enEchec) {
+      if (vague.repriseManuelle) {
+        return {
+          action: 'question',
+          motif: `vague ${vague.numero} marquée reprise-manuelle : arrêt sur l'échec de ${enEchec.session}`,
+          options: { source: 'reprise-manuelle', session: enEchec.session },
+        };
+      }
+      const decision = remedier(enEchec, enqueteTotalPlan, sortie.remediationOpus ?? 0);
+      if (decision.action === 'verifier-premisse') {
+        decision.chemin = `plans/${sortie.plan}/${enEchec.session}.echec.md`;
+      }
+      if (decision.action === 'reprendre' || decision.action === 'enqueter') {
+        Object.assign(decision, champAgent(decision.modele, EFFORT_DU_MODELE[decision.modele]));
+      }
+      if (enEchec.echec.avertissementAuto) {
+        decision.avertissement = decision.avertissement
+          ? `${decision.avertissement} · ${enEchec.echec.avertissementAuto}`
+          : enEchec.echec.avertissementAuto;
+      }
+      return decision;
+    }
+
+    const toutesFaites = membres.every((s) => s.etat === 'faite'); // vrai par défaut si vague sans membre (clôture)
+    // Vague entièrement faite : revue (plans stampés `Workflow :` seulement — un plan antérieur à
+    // C4/C3 n'a jamais produit de .revue.md, lui en exiger un serait un état deviné), puis
+    // validation-humaine.
+    if (sortie.workflow) {
+      // Une session `low` n'est jamais relue (C7, relecteur-session.md « Sessions à sauter ») —
+      // exclue ici, au seul endroit qui décide quoi relire (T3, P7/S2), plutôt que de compter sur
+      // la prose du relecteur pour l'appliquer.
+      const sansRevue = membres.filter(
+        (s) =>
+          s.etat === 'faite' &&
+          s.effort !== 'low' &&
+          s.zone &&
+          s.zone.replace(/`/g, '').trim().toLowerCase() !== 'aucune' &&
+          (!s.revue || s.revue.couverture !== 'complète'),
+      );
+      if (sansRevue.length > 0) {
+        const epuisee = sansRevue.find(s => s.revue && s.revue.reprises >= 1);
+        if (epuisee) return { action: 'question', motif: `revue ${epuisee.session} interrompue après une reprise`,
+          options: { source: 'revue-incomplete', session: epuisee.session } };
+        return {
+          action: 'relire',
+          vague: vague.numero,
+          sessions: sansRevue.map((s) => ({ session: s.session, effort: s.effort, reprise: s.revue ? 1 : 0 })),
+        };
+      }
+    }
+
+    // « validée » (accents/casse libres) dans le libellé de la vague l'acquitte explicitement
+    // (T5, P10/S2) — l'acquittement implicite par le démarrage de la vague suivante reste valable.
+    if (vague.validationHumaine && !vague.validee &&
+        (toutesFaites || (membres.some(s => s.etat === 'faite') &&
+          !membres.some(s => s.etat === 'a-lancer' && !compromises(s))))) {
+      const suivante = vagues.find((v) => v.numero === vague.numero + 1);
+      const suivanteDemarree = suivante
+        ? suivante.sessions.some((id) => {
+            const s = sortie.sessions.find((x) => x.session === id);
+            return s && s.etat !== 'a-lancer';
+          })
+        : false;
+      if (!suivanteDemarree) {
+        return { action: 'validation-humaine', vague: vague.numero };
+      }
+    }
+    if (!toutesFaites) {
+      const candidats = membres.filter((s) => s.etat === 'a-lancer');
+      bloques.push(...candidats.filter(comp => compromises(comp)).map(s => s.session));
+      const aLancer = candidats.filter(s => !compromises(s));
+      if (aLancer.length === 0) continue;
+      const effortInvalide = aLancer.find((s) => !EFFORTS_LANCABLES.includes(s.effort));
+      if (effortInvalide) return questionEffortInvalide(effortInvalide);
+      const questionArbre = arreteSurArbreSale(aLancer, sortie.plan);
+      if (questionArbre) return questionArbre;
+      return {
+        action: 'lancer',
+        vague: vague.numero,
+        parallele: vague.parallelisable,
+        sessions: aLancer.map((s) => ({
+          session: s.session,
+          modele: s.modele,
+          effort: s.effort,
+          ...champAgent(s.modele, s.effort),
+        })),
+      };
+    }
+
+    // Sinon : vague déjà validée (explicitement, ou implicitement par le démarrage de la suivante) —
+    // continuer.
+  }
+
+  // Une session `a-lancer` qui n'appartient à aucune vague ne sera jamais lancée par la boucle
+  // ci-dessus : le dire plutôt que rendre `fini` sur un plan qui a encore du travail non ordonnancé
+  // (T4, P10/S2).
+  const idsDansVagues = new Set(vagues.flatMap((v) => v.sessions));
+  const horsVague = sortie.sessions.filter((s) => s.etat === 'a-lancer' && !idsDansVagues.has(s.session));
+  if (horsVague.length > 0) {
+    return {
+      action: 'question',
+      motif: `session(s) absente(s) de toute vague de l'Ordonnancement : ${horsVague.map((s) => s.session).join(', ')}`,
+      options: { source: 'session-hors-vague', sessions: horsVague.map((s) => s.session) },
+    };
+  }
+
+  if (bloques.length > 0) return { action: 'question', motif: `prérequis non validés : ${bloques.join(', ')}`,
+    options: { source: 'dependance-revue', sessions: bloques } };
+
+  // Clôture (T6, P10/S2, décision 2026-09-24 point 4) : un plan stampé `Workflow :` sans `Clos :`
+  // dans l'index revient à l'orchestrateur pour `fin-de-plan.md`, qui pose le marqueur — un plan déjà
+  // clos, ou antérieur à C4 (jamais stampé), rend directement `fini`.
+  if (sortie.workflow && !sortie.clos) {
+    return { action: 'cloturer' };
+  }
+  return { action: 'fini' };
+}
+
+/** Écart `Workflow : v` index ↔ version courante — un avertissement, jamais une action (Étape 4). */
+function avertissementVersion(sortie) {
+  if (!sortie.workflow) return null;
+  try {
+    const binDir = dirname(fileURLToPath(import.meta.url));
+    const manifestSource = join(binDir, '..', '.claude-plugin', 'plugin.json');
+    const racine = racineDepot();
+    const manifestVendore = racine ? join(racine, '.claude', 'workflow', 'manifest.json') : null;
+    let versionCourante = null;
+    if (existsSync(manifestSource)) {
+      versionCourante = JSON.parse(readFileSync(manifestSource, 'utf8')).version;
+    } else if (manifestVendore && existsSync(manifestVendore)) {
+      versionCourante = JSON.parse(readFileSync(manifestVendore, 'utf8')).version;
+    }
+    if (versionCourante && sortie.workflow.replace(/^v/, '') !== String(versionCourante).replace(/^v/, '')) {
+      return `index déclare Workflow : v${sortie.workflow}, plugin en v${versionCourante}`;
+    }
+  } catch {
+    /* best-effort, jamais bloquant */
+  }
+  return null;
+}
+
+function formaterTexte(action) {
+  const champs = Object.entries(action)
+    .filter(([cle]) => cle !== 'action')
+    .map(([cle, valeur]) => `${cle}: ${typeof valeur === 'object' ? JSON.stringify(valeur) : valeur}`);
+  let ligne;
+  switch (action.action) {
+    case 'lancer':
+      ligne = `lancer — vague ${action.vague} (${action.parallele ? 'parallèle' : 'séquentiel'}) : ${
+        action.sessions.map((s) => s.session).join(', ') || '—'
+      }`;
+      break;
+    case 'verifier-premisse':
+      ligne = `verifier-premisse — ${action.session}`;
+      break;
+    case 'reprendre':
+      ligne = `reprendre — ${action.session} (${action.modele}${action.option ? ` · option ${action.option}` : ''})`;
+      break;
+    case 'enqueter':
+      ligne = `enqueter — ${action.session} (${action.modele})`;
+      break;
+    case 'relancer-interrompue':
+      ligne = `relancer-interrompue — ${action.session} (${action.modele})`;
+      break;
+    case 'relire':
+      ligne = `relire — vague ${action.vague} : ${action.sessions.map((s) => s.session).join(', ')}`;
+      break;
+    case 'pousser':
+      ligne = 'pousser';
+      break;
+    case 'validation-humaine':
+      ligne = `validation-humaine — vague ${action.vague}`;
+      break;
+    case 'question':
+      ligne = `question — ${action.motif}`;
+      break;
+    case 'fini':
+      ligne = 'fini';
+      break;
+    case 'cloturer':
+      ligne = 'cloturer';
+      break;
+    default:
+      ligne = action.action;
+  }
+  return [ligne, ...champs, ...lignesAppelAgent(action)].join('\n');
+}
+
+/** Une ligne lisible par appel d'agent prêt à recopier (D2) — `S1 → subagent_type: session-low ·
+ * model: sonnet` — pour la sortie sans `--json` de `lancer`, `reprendre`, `enqueter`. */
+function lignesAppelAgent(action) {
+  const ligne = (session, agent) => `${session} → subagent_type: ${agent.subagent_type} · model: ${agent.model}`;
+  if (action.action === 'lancer') {
+    return action.sessions.filter((s) => s.agent).map((s) => ligne(s.session, s.agent));
+  }
+  if (
+    (action.action === 'reprendre' || action.action === 'enqueter' || action.action === 'relancer-interrompue') &&
+    action.agent
+  ) {
+    return [ligne(action.session, action.agent)];
+  }
+  return [];
+}
+
+// ── Assemblage ─────────────────────────────────────────────────────────────────────────────────────
+const dossierPlan = join(RACINE, 'plans', plan);
+const index = lireIndex(dossierPlan);
+if (index.erreur) {
+  console.error(`prochaine-action: ${index.erreur}`);
+  process.exit(2);
+}
+
+const refs = refsCommitees();
+for (const s of index.sessions) {
+  const cheminEchec = join(dossierPlan, `${s.session}.echec.md`);
+  const cheminRevue = join(dossierPlan, `${s.session}.revue.md`);
+
+  const taches = parseTaches(s.taches).map((n) => `${plan}/${s.session}/T${n}`);
+  const toutesCommitees = taches.length > 0 && taches.every((ref) => refs.has(ref));
+
+  if (s.coche) {
+    s.etat = 'faite';
+  } else if (existsSync(cheminEchec)) {
+    s.etat = 'echec';
+  } else if (toutesCommitees) {
+    s.etat = 'faite';
+  } else {
+    s.etat = 'a-lancer';
+  }
+
+  s.preuve = index.preuveN0 && s.etat === 'faite' ? verifierPreuve(RACINE, `${plan}/${s.session}`) : null;
+  s.echec = s.etat === 'echec' ? lireEchec(cheminEchec) : null;
+  // Une revue toujours présente se lit normalement ; une revue **ajoutée par un commit** puis
+  // supprimée depuis (tri de clôture) compte comme faite mais sans `Bloquant :` à relire — le
+  // fichier n'existe plus (T6, P10/S2).
+  if (existsSync(cheminRevue)) {
+    s.revue = lireRevue(cheminRevue);
+  } else if (ajouteParUnCommit(`plans/${plan}/${s.session}.revue.md`)) {
+    const derniere = git('log', '-1', '--diff-filter=AM', '--format=%H', '--', `plans/${plan}/${s.session}.revue.md`);
+    const texte = derniere ? git('show', `${derniere}:plans/${plan}/${s.session}.revue.md`) : null;
+    s.revue = texte ? lireRevue(cheminRevue, texte) : null;
+  } else {
+    s.revue = null;
+  }
+}
+
+// Racine introuvable (worktree lié d'un dépôt à `.git` déplacé) : `waveLock` vrai par défaut,
+// même refus que sous un vrai `.claude/wave.lock` (plugin/hooks/lib.mjs `vagueParallele`).
+const racineActuelle = racineDepot();
+const sortie = {
+  plan,
+  workflow: index.workflow,
+  clos: index.clos,
+  preuveN0: index.preuveN0,
+  remediationOpus: index.remediationOpus,
+  depot: {
+    waveLock: racineActuelle === null || existsSync(join(racineActuelle, '.claude', 'wave.lock')),
+    amont: etatAmont(),
+    rebase: rebaseEnCours(),
+    arbreSale: arbreTrackedSale(),
+  },
+  vagues: index.vagues,
+  sessions: index.sessions,
+};
+
+if (etat) {
+  process.stdout.write(JSON.stringify(sortie, null, 2) + '\n');
+  process.exit(0);
+}
+
+const action = prochaineAction(sortie);
+const avertissement = avertissementVersion(sortie);
+if (avertissement) {
+  // Ne pas écraser un avertissement déjà posé (modèle inconnu, D2) : les deux comptent.
+  action.avertissement = action.avertissement ? `${action.avertissement} · ${avertissement}` : avertissement;
+}
+
+process.stdout.write((json ? JSON.stringify(action, null, 2) : formaterTexte(action)) + '\n');
+process.exit(0);
