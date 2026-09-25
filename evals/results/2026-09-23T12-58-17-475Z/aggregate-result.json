@@ -1,0 +1,256 @@
+{
+  "schemaVersion": 1,
+  "claudeVersion": "2.1.280",
+  "startedAt": "2026-09-23T12:58:17.475Z",
+  "durationSeconds": 59,
+  "costUsd": 0.5969974,
+  "partial": false,
+  "suite": {
+    "root": "C:\\Users\\kovu\\Projets\\Templates\\plugin",
+    "ablation": "with-without",
+    "caseFilter": "verif-visuelle-pas-revue-d-usage",
+    "threshold": 1,
+    "concurrency": 1,
+    "plugins": [
+      {
+        "name": "workflow",
+        "version": "0.41.0",
+        "path": "C:\\Users\\kovu\\Projets\\Templates\\plugin"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "verif-visuelle-pas-revue-d-usage",
+      "dir": "evals\\verif-visuelle-pas-revue-d-usage",
+      "source": "prose",
+      "promptMarkdown": "J'ai fini la tâche T3 de `plans/P1/S2.md` qui change l'écran de connexion, vérifie-le\nvisuellement.",
+      "runsPerCase": 3,
+      "timeoutSeconds": 300,
+      "maxTurns": 3,
+      "graders": [
+        {
+          "name": "pas-revue-d-usage",
+          "type": "tool_used",
+          "weight": 1,
+          "config": {
+            "tool": "Skill",
+            "input_match": "\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?revue-d-usage\"",
+            "min": 0,
+            "max": 0
+          }
+        },
+        {
+          "name": "verif-visuelle-invoquee",
+          "type": "tool_used",
+          "weight": 1,
+          "config": {
+            "tool": "Skill",
+            "input_match": "\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?verif-visuelle\"",
+            "min": 1
+          }
+        }
+      ],
+      "arms": {
+        "with": [
+          {
+            "score": 1,
+            "passed": true,
+            "turns": 4,
+            "costUsd": 0.12324440000000002,
+            "judgeCostUsd": 0,
+            "durationSeconds": 9,
+            "startedAt": "2026-09-23T12:58:17.563Z",
+            "error": "exit 1: Reached maximum number of turns (3)",
+            "tracePath": "C:\\Users\\kovu\\AppData\\Local\\Temp\\claude-eval-SuWURG\\out\\trace.jsonl",
+            "skippedPaidGraders": false,
+            "graders": [
+              {
+                "name": "pas-revue-d-usage",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 0..0)",
+                "withOnly": false,
+                "scored": true
+              },
+              {
+                "name": "verif-visuelle-invoquee",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 1x (expected 1..∞)",
+                "withOnly": false,
+                "scored": true
+              }
+            ]
+          },
+          {
+            "score": 1,
+            "passed": true,
+            "turns": 4,
+            "costUsd": 0.1259448,
+            "judgeCostUsd": 0,
+            "durationSeconds": 9,
+            "startedAt": "2026-09-23T12:58:26.750Z",
+            "error": "exit 1: Reached maximum number of turns (3)",
+            "tracePath": "C:\\Users\\kovu\\AppData\\Local\\Temp\\claude-eval-T6TE7T\\out\\trace.jsonl",
+            "skippedPaidGraders": false,
+            "graders": [
+              {
+                "name": "pas-revue-d-usage",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 0..0)",
+                "withOnly": false,
+                "scored": true
+              },
+              {
+                "name": "verif-visuelle-invoquee",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 1x (expected 1..∞)",
+                "withOnly": false,
+                "scored": true
+              }
+            ]
+          },
+          {
+            "score": 1,
+            "passed": true,
+            "turns": 4,
+            "costUsd": 0.12644260000000002,
+            "judgeCostUsd": 0,
+            "durationSeconds": 9,
+            "startedAt": "2026-09-23T12:58:35.900Z",
+            "error": "exit 1: Reached maximum number of turns (3)",
+            "tracePath": "C:\\Users\\kovu\\AppData\\Local\\Temp\\claude-eval-O6GPXG\\out\\trace.jsonl",
+            "skippedPaidGraders": false,
+            "graders": [
+              {
+                "name": "pas-revue-d-usage",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 0..0)",
+                "withOnly": false,
+                "scored": true
+              },
+              {
+                "name": "verif-visuelle-invoquee",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 1x (expected 1..∞)",
+                "withOnly": false,
+                "scored": true
+              }
+            ]
+          }
+        ],
+        "without": [
+          {
+            "score": 0.5,
+            "passed": false,
+            "turns": 4,
+            "costUsd": 0.07092799999999999,
+            "judgeCostUsd": 0,
+            "durationSeconds": 10,
+            "startedAt": "2026-09-23T12:58:45.277Z",
+            "error": "exit 1: Reached maximum number of turns (3)",
+            "tracePath": "C:\\Users\\kovu\\AppData\\Local\\Temp\\claude-eval-u105Hq\\out\\trace.jsonl",
+            "skippedPaidGraders": false,
+            "graders": [
+              {
+                "name": "pas-revue-d-usage",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 0..0)",
+                "withOnly": false,
+                "scored": true
+              },
+              {
+                "name": "verif-visuelle-invoquee",
+                "passed": false,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 1..∞)",
+                "withOnly": false,
+                "scored": true
+              }
+            ]
+          },
+          {
+            "score": 0.5,
+            "passed": false,
+            "turns": 4,
+            "costUsd": 0.0767544,
+            "judgeCostUsd": 0,
+            "durationSeconds": 11,
+            "startedAt": "2026-09-23T12:58:55.171Z",
+            "error": "exit 1: Reached maximum number of turns (3)",
+            "tracePath": "C:\\Users\\kovu\\AppData\\Local\\Temp\\claude-eval-8YhptK\\out\\trace.jsonl",
+            "skippedPaidGraders": false,
+            "graders": [
+              {
+                "name": "pas-revue-d-usage",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 0..0)",
+                "withOnly": false,
+                "scored": true
+              },
+              {
+                "name": "verif-visuelle-invoquee",
+                "passed": false,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 1..∞)",
+                "withOnly": false,
+                "scored": true
+              }
+            ]
+          },
+          {
+            "score": 0.5,
+            "passed": false,
+            "turns": 4,
+            "costUsd": 0.0736832,
+            "judgeCostUsd": 0,
+            "durationSeconds": 10,
+            "startedAt": "2026-09-23T12:59:06.015Z",
+            "error": "exit 1: Reached maximum number of turns (3)",
+            "tracePath": "C:\\Users\\kovu\\AppData\\Local\\Temp\\claude-eval-MNxpjk\\out\\trace.jsonl",
+            "skippedPaidGraders": false,
+            "graders": [
+              {
+                "name": "pas-revue-d-usage",
+                "passed": true,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 0..0)",
+                "withOnly": false,
+                "scored": true
+              },
+              {
+                "name": "verif-visuelle-invoquee",
+                "passed": false,
+                "weight": 1,
+                "explanation": "Skill called 0x (expected 1..∞)",
+                "withOnly": false,
+                "scored": true
+              }
+            ]
+          }
+        ]
+      },
+      "aggregates": {
+        "score": 1,
+        "passRate": 1,
+        "scoreWithout": 0.5,
+        "passRateWithout": 0,
+        "delta": 0.5
+      }
+    }
+  ],
+  "aggregates": {
+    "casesTotal": 1,
+    "casesPassed": 1,
+    "overallScore": 1,
+    "overallPassRate": 1,
+    "meanDelta": 0.5
+  }
+}
