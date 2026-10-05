@@ -1,0 +1,19 @@
+{
+  "_comment": "Plafonds de lignes des fichiers de contexte. Source unique : lue par les hooks ET par la skill /purge-contexte. Dépassement = tâche d'archivage obligatoire avant de continuer.",
+  "_comment_echec": "'plans/P<n>/S<k>.echec.md' (40) est une clé à MOTIF, posée ici comme donnée (WORKFLOW.md §7) : depassements() (plugin/hooks/lib.mjs) fait join(cwd, fichier) sur un chemin FIXE et ne matchera donc jamais ce motif littéral — elle ne casse rien (fichier introuvable → ignoré) mais n'est pas encore appliquée. À câbler dans lib.mjs (résoudre le motif contre les plans réels du dépôt) avant de s'y fier.",
+  "plafonds": {
+    "STATUS.md": 80,
+    "TASKS.md": 60,
+    "VALIDATION.md": 60,
+    "DECISIONS.md": 150,
+    "PROJECT_MAP.md": 200,
+    "CLAUDE.md": 200,
+    "plans/P<n>/S<k>.echec.md": 40
+  },
+  "fichiersDeSuivi": [
+    "STATUS.md",
+    "TASKS.md",
+    "VALIDATION.md",
+    "DECISIONS.md"
+  ]
+}
