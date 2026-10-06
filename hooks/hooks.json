@@ -1,0 +1,63 @@
+{
+  "_comment": "Câblage des hooks du plugin workflow — source du câblage en dépôt source et en marketplace ; en projet VENDORÉ, plugin/templates/project-settings.json (_comment_hooks) câble les mêmes cinq hooks, sans plugin. SessionStart (injection CLAUDE-BASE + dérive du contexte + modèle contre plan) · PreToolUse Bash|PowerShell (garde-fous git) · PostToolUse Edit|Write (formatage prettier conditionnel) · PostModelSwitch (journal des changements de modèle, jamais bloquant) · Stop (garde-fou de fin de session). Chemins résolus via ${CLAUDE_PLUGIN_ROOT}, portables (cache local ou cloud).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart-contexte.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse-git.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/posttooluse-format.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/postmodelswitch-journal.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/stop-contexte.mjs\"",
+            "timeout": 20,
+            "statusMessage": "Vérification du contexte…"
+          }
+        ]
+      }
+    ]
+  }
+}
