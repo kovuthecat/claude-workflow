@@ -1,0 +1,9 @@
+{
+  "name": "affichage",
+  "version": "0.57.0",
+  "description": "Affichage du workflow : ligne d'etat (plan, limites 5 h / 7 j, contexte), panneau limites, panneau fichiers (etat git).",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "templates"
+  }
+}
