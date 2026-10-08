@@ -1,0 +1,22 @@
+{
+  "name": "garde-fous",
+  "version": "0.58.0",
+  "description": "Garde-fous du workflow : O1 filet de modele (un sous-agent de session de plan sans modele recoit celui de l'index), O3 premier plan par defaut (appel Agent sans run_in_background).",
+  "author": {
+    "name": "templates"
+  },
+  "userConfig": {
+    "o1": {
+      "type": "boolean",
+      "title": "O1 - filet de modele",
+      "description": "Un sous-agent lance sur plans/P<n>/S<k>.md sans modele recoit celui de la colonne Modele de l'index. Un modele explicite n'est jamais ecrase.",
+      "default": true
+    },
+    "o3": {
+      "type": "boolean",
+      "title": "O3 - premier plan par defaut",
+      "description": "Un appel Agent sans run_in_background part au premier plan.",
+      "default": true
+    }
+  }
+}
