@@ -1,0 +1,9 @@
+{
+  "name": "affichage",
+  "version": "0.61.0",
+  "description": "Affichage du workflow : bandeau au-dessus du prompt (plan, limites 5 h / 7 j), panneaux limites, fichiers (etat git) et plan ; titre de session Projet - Plan - Session.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "templates"
+  }
+}
