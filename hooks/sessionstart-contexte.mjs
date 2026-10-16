@@ -1,0 +1,333 @@
+// Hook SessionStart — rend visible la dérive du contexte au lieu de la laisser se découvrir
+// trois semaines plus tard, ET injecte les règles communes (CLAUDE-BASE.md) dans le contexte
+// de session (D-P2-2 : remplace l'import `@C:\...\CLAUDE-BASE.md` du CLAUDE.md projet, qui ne
+// fonctionne pas en cloud). Les vérifications de dérive n'écrivent RIEN si tout est sain ;
+// l'émission de CLAUDE-BASE.md, elle, a lieu à chaque session (coût token assumé, D-P2-2).
+
+import { readFileSync, existsSync, mkdirSync, writeFileSync, statSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import {
+  lireEntree, repertoireProjet, estUnDepot, git, depassements, racineIntrouvable,
+  repereSession, repondre, riendafaire, racineDepot,
+  recupererAmont, etatAmont, aUnRemote, brancheCourante, brancheParDefaut,
+  familleModele, prochaineSession, derniereVersionPubliee, versionSuperieure,
+} from './lib.mjs';
+
+const ICI = dirname(fileURLToPath(import.meta.url));
+
+const entree = await lireEntree();
+const cwd = repertoireProjet(entree);
+
+if (!estUnDepot(cwd)) riendafaire();
+
+// Repère HEAD au démarrage — seule chose qui permette au hook Stop de savoir ce que CETTE session
+// a commité, et donc d'exiger la revue de session qui va avec (`revuesManquantes`). Écrit une seule
+// fois : sur `compact` ou `resume`, le repère existe déjà et réécrire HEAD effacerait les commits
+// déjà pris. Best-effort — un échec ici ne fait que désactiver le contrôle, jamais bloquer.
+try {
+  const { dossier, chemin } = repereSession(entree, cwd, 'head');
+  if (!existsSync(chemin)) {
+    const tete = git(cwd, 'rev-parse', 'HEAD');
+    if (tete) {
+      mkdirSync(dossier, { recursive: true });
+      writeFileSync(chemin, tete);
+    }
+  }
+} catch { /* repère indisponible : le Stop retombera en fail-open */ }
+
+const lignes = [];
+
+// Émission de CLAUDE-BASE.md — chemin relatif au fichier du hook (comme lib.mjs pour plafonds.json),
+// jamais de chemin absolu : portable en cloud comme dans un plugin installé depuis le cache.
+// Sautée sur `resume` : les règles sont déjà dans le contexte repris, les réinjecter les duplique.
+// Émise en revanche sur `compact` — après compaction, le contexte a justement été élagué.
+// Le champ est `session_start_reason` ; `source` est lu en repli, la doc étant ambiguë sur le nom
+// et un faux négatif ici ne coûtant qu'une réinjection (le comportement d'avant cette ligne).
+const reprise = (entree.session_start_reason ?? entree.source) === 'resume';
+const cheminClaudeBase = join(ICI, '..', 'CLAUDE-BASE.md');
+let claudeBase = '';
+if (reprise) {
+  claudeBase = '';
+} else if (existsSync(cheminClaudeBase)) {
+  try {
+    const contenu = readFileSync(cheminClaudeBase, 'utf8');
+    claudeBase =
+      '<!-- règles communes injectées par le plugin workflow -->\n' + contenu;
+  } catch {
+    claudeBase = '**Avertissement** : CLAUDE-BASE.md illisible malgré sa présence.';
+  }
+} else {
+  claudeBase =
+    '**Avertissement** : CLAUDE-BASE.md introuvable à la racine du plugin (${CLAUDE_PLUGIN_ROOT}/CLAUDE-BASE.md).';
+}
+
+if (racineIntrouvable(cwd)) {
+  lignes.push(
+    "**Racine du dépôt introuvable** (worktree lié d'un dépôt à `.git` déplacé) : ni commit ni push " +
+    "(ils sont bloqués par hook) — travaille depuis l'arbre principal."
+  );
+}
+
+// Retard sur l'amont, et branche d'atterrissage — les deux se constatent au démarrage, quand la
+// correction est encore gratuite. Un arbre en retard produit un conflit ou, sur un chemin qui pousse
+// en `--force`, écrase du travail déjà publié ; une branche autre que celle d'intégration produit du
+// travail que personne ne voit venir. Muet quand la racine est introuvable : ni pull ni push n'y sont permis.
+if (!racineIntrouvable(cwd) && aUnRemote(cwd)) {
+  recupererAmont(cwd);
+  const amont = etatAmont(cwd);
+  if (amont && amont.retard > 0) {
+    lignes.push(
+      `**Dépôt en retard de ${amont.retard} commit(s) sur \`${amont.amont}\`** — rattraper ` +
+      `(\`git pull --rebase\`) AVANT de commencer (\`WORKFLOW.md\` §4b). Travailler sur un arbre en ` +
+      `retard, c'est préparer un conflit ou écraser ce qui a été poussé d'ailleurs.`
+    );
+  }
+  const courante = brancheCourante(cwd);
+  const integration = brancheParDefaut(cwd);
+  // À jour avec la branche d'intégration, pas seulement avec son propre amont : une branche de
+  // worktree ou d'exploration suit `origin/<elle-même>` (ou rien), et le contrôle ci-dessus la dit
+  // à jour pendant que `main` avance sans elle. Sauté quand l'amont EST déjà la branche
+  // d'intégration — le retard y a déjà été dit. Ref absente (jamais récupérée) : `git` rend null, muet.
+  const refIntegration = `origin/${integration}`;
+  if (amont?.amont !== refIntegration) {
+    const retardIntegration = Number(git(cwd, 'rev-list', '--count', `HEAD..${refIntegration}`));
+    if (retardIntegration > 0) {
+      lignes.push(
+        `**En retard de ${retardIntegration} commit(s) sur \`${refIntegration}\`** ` +
+        `(branche \`${courante ?? 'HEAD détachée'}\`) — intégrer \`${refIntegration}\` AVANT de ` +
+        `commencer (\`WORKFLOW.md\` §4b) : ce qui a été fusionné depuis n'est pas dans cet arbre.`
+      );
+    }
+  }
+  if (courante && courante !== integration) {
+    lignes.push(
+      `**Branche \`${courante}\`, alors que l'intégration se fait sur \`${integration}\`** — le ` +
+      `travail de ce workflow vit et se pousse sur \`${integration}\`, **session cloud comprise** ` +
+      `(\`WORKFLOW.md\` §4b). Ne pas finir le plan ici sans l'avoir dit.`
+    );
+  }
+}
+
+// Modèle courant contre celui que le plan demande. La ligne « À régler AVANT de lancer » (§3) ne
+// fait que **rappeler** : jusqu'ici rien ne vérifiait, et une session partie au hasard des réglages
+// de la veille ne se découvrait qu'au résultat. Le hook reçoit `model` — si la prochaine session du
+// plan en cours demande une autre famille, le dire maintenant, quand la correction est encore gratuite.
+// Muet quand la racine du dépôt est introuvable et dès qu'aucun plan ouvert ne déclare de modèle.
+if (!racineIntrouvable(cwd)) {
+  const familleCourante = familleModele(entree.model);
+  if (familleCourante) {
+    // La prochaine session du plan le plus récent, pas toutes les sessions ouvertes : un vieux plan
+    // dormant de la même famille taisait l'écart (`lib.mjs` `prochaineSession`).
+    const prochaine = prochaineSession(cwd);
+    const attendue = prochaine ? familleModele(prochaine.modele) : null;
+    if (attendue && attendue !== familleCourante) {
+      lignes.push(
+        `**Session lancée en ${familleCourante}, la prochaine session du plan demande ${attendue}** ` +
+        `(${prochaine.plan}/${prochaine.session} ${prochaine.modele}/${prochaine.effort}). Si c'est elle ` +
+        `que tu lances : régler modèle **et** effort avant de commencer (\`WORKFLOW.md\` §3) — en ` +
+        `changer en cours de route repaie tout le préfixe (§3b).`
+      );
+    }
+  }
+}
+
+// `git log -- STATUS.md` retrouve le dernier commit ayant touché le fichier même si celui-ci a
+// depuis été SUPPRIMÉ : sans ce test d'existence, un projet qui retire son STATUS.md hérite d'un
+// « retard » qui grandit à chaque commit et que rien ne peut résorber. Un avertissement permanent
+// et inactionnable apprend à ignorer la sortie des hooks — il coûte donc aussi les signaux justes.
+const dernierStatus = existsSync(join(cwd, 'STATUS.md'))
+  ? git(cwd, 'log', '-1', '--format=%H', '--', 'STATUS.md')
+  : null;
+if (dernierStatus) {
+  const retard = git(cwd, 'rev-list', '--count', `${dernierStatus}..HEAD`);
+  if (retard && Number(retard) >= 3) {
+    lignes.push(`**STATUS.md a ${retard} commits de retard** — vérifie qu'il décrit encore l'état réel.`);
+  }
+}
+
+for (const d of depassements(cwd)) {
+  lignes.push(`**${d.fichier} : ${d.lignes}/${d.plafond} lignes** — archivage dû (/purge-contexte).`);
+}
+
+// Version du workflow vendoré, contre le dernier tag du dépôt public (C4). Jamais dans un
+// sous-agent : fait déjà vérifié, `SessionStart` ne s'y déclenche pas. Dépôt non vendoré (pas de
+// manifeste, comme CE dépôt source) → muet ; le réseau et le cache 24 h sont entièrement portés
+// par `derniereVersionPubliee`, qui rend `null` sans jamais bloquer sur un échec.
+try {
+  const racineManifeste = racineDepot(cwd);
+  const cheminManifeste = racineManifeste
+    ? join(racineManifeste, '.claude', 'workflow', 'manifest.json')
+    : null;
+  if (cheminManifeste && existsSync(cheminManifeste)) {
+    const manifeste = JSON.parse(readFileSync(cheminManifeste, 'utf8'));
+    const versionVendoree = manifeste.version;
+    const versionPubliee = derniereVersionPubliee(cwd);
+    if (versionVendoree && versionPubliee && versionSuperieure(versionPubliee, versionVendoree)) {
+      const urgent = manifeste.correctifCritiqueDepuis
+        && versionSuperieure(manifeste.correctifCritiqueDepuis, versionVendoree);
+      lignes.push(
+        `**Workflow vendoré v${versionVendoree}, source v${versionPubliee}** — /maj-workflow ` +
+        (urgent ? '**avant la prochaine vague**.' : 'à la prochaine frontière de plan.')
+      );
+    }
+  }
+} catch { /* manifeste illisible ou JSON invalide : contrôle désactivé, jamais de faux positif */ }
+
+// Lignes de version : aussi écrites dans `systemMessage` (affiché à l'utilisateur d'après la doc des
+// hooks, champ commun « Warning message shown to the user »), alors que `additionalContext` ne va
+// qu'au modèle — le poste est resté en 0.55.0 face à une 0.65.0 sans que l'utilisateur voie rien
+// (constat du 2026-10-14 : le hook 0.55.0 joué à la main émet bien la ligne, mais en
+// `additionalContext` seulement).
+const lignesVersion = [];
+
+// Entrées `workflow@templates` de `installed_plugins.json` qui visent CE dépôt avec une version plus
+// ancienne que la source. Chemins comparés sans tenir compte de la casse SEULEMENT pour un chemin à
+// lettre de lecteur (Windows) : sur Linux, deux casses sont deux dossiers. Plusieurs entrées pour le
+// même dépôt (une par casse) : celle en retard est un DOUBLON, que `plugin update` ne met pas à jour
+// (il n'agit que sur l'entrée de la casse courante) — le remède la retire. Aucun processus lancé,
+// muet sur toute erreur de lecture.
+function signalerEntreesEnRetard(racineSource, cheminPluginSource) {
+  try {
+    const versionSource = JSON.parse(readFileSync(cheminPluginSource, 'utf8')).version;
+    const config = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+    const plugins = JSON.parse(readFileSync(join(config, 'plugins', 'installed_plugins.json'), 'utf8')).plugins || {};
+    const norm = (p) => {
+      const n = String(p).replace(/\\/g, '/').replace(/\/+$/, '');
+      return /^[A-Za-z]:\//.test(n) ? n.toLowerCase() : n;
+    };
+    const racine = norm(racineSource);
+    const entrees = Object.entries(plugins)
+      .filter(([cle, liste]) => cle.startsWith('workflow@templates') && Array.isArray(liste))
+      .flatMap(([, liste]) => liste)
+      .filter((x) => x.scope === 'local' && x.projectPath && norm(x.projectPath) === racine && x.version);
+    for (const x of entrees) {
+      if (!versionSuperieure(versionSource, x.version)) continue;
+      const l = entrees.length > 1
+        ? `**Entrée en doublon et en retard : workflow@templates v${x.version}** (projectPath ` +
+          `\`${x.projectPath}\`, source v${versionSource}) — \`claude plugin update\` ne la met pas à ` +
+          'jour. La retirer : supprimer cette entrée de `installed_plugins.json` (aucune casse du ' +
+          'dossier ne la fait atteindre par `plugin uninstall`).'
+        : `**Plugin installé v${x.version}, source v${versionSource}** (projectPath ` +
+          `\`${x.projectPath}\`) : \`claude plugin update workflow@templates --scope local\`.`;
+      lignes.push(l);
+      lignesVersion.push(l);
+    }
+  } catch { /* fichier absent, illisible ou JSON invalide : contrôle désactivé, jamais de faux positif */ }
+}
+
+// Plugin CHARGÉ contre la copie de travail, dans le DÉPÔT SOURCE seulement (pas de manifeste vendoré,
+// et `plugin/.claude-plugin/plugin.json` présent — CE dépôt). Un incident du 2026-09-22 (rejoué le
+// 2026-09-23 sur Templates, le 2026-09-24 sur DrumsTraining) : le plugin local installé au cache
+// n'était pas rechargé après une publication, sans que rien ne le signale — un poste continuait de
+// dérouler une version périmée en pensant éditer la dernière. `ICI` est TOUJOURS la racine du plugin
+// réellement chargé pour cette session (chemin relatif au fichier du hook, comme CLAUDE-BASE.md
+// ci-dessus) — jamais `process.env.CLAUDE_PLUGIN_ROOT`, qui n'est qu'un jeton de substitution du
+// `command` de `hooks.json`, pas une variable d'environnement du process node.
+try {
+  const racineSource = racineDepot(cwd);
+  const cheminManifesteVendore = racineSource
+    ? join(racineSource, '.claude', 'workflow', 'manifest.json')
+    : null;
+  const cheminPluginSource = racineSource
+    ? join(racineSource, 'plugin', '.claude-plugin', 'plugin.json')
+    : null;
+  const estDepotSource = racineSource
+    && !(cheminManifesteVendore && existsSync(cheminManifesteVendore))
+    && cheminPluginSource && existsSync(cheminPluginSource);
+  if (estDepotSource) {
+    const cheminPluginCharge = join(ICI, '..', '.claude-plugin', 'plugin.json');
+    if (existsSync(cheminPluginCharge)) {
+      const versionChargee = JSON.parse(readFileSync(cheminPluginCharge, 'utf8')).version;
+      const versionSource = JSON.parse(readFileSync(cheminPluginSource, 'utf8')).version;
+      if (versionChargee && versionSource && versionChargee !== versionSource) {
+        const l = `**Plugin chargé v${versionChargee}, source v${versionSource}** : ` +
+          '`claude plugin update workflow@templates --scope local`.';
+        lignes.push(l);
+        lignesVersion.push(l);
+      }
+    }
+    signalerEntreesEnRetard(racineSource, cheminPluginSource);
+  }
+} catch { /* plugin.json illisible ou JSON invalide : contrôle désactivé, jamais de faux positif */ }
+
+// Mods du projet absents ou en retard sur ce poste (P16, 2026-10-07). Un mod ne se charge que depuis
+// un plugin INSTALLÉ `--scope local` pour ce dossier ; un poste neuf qui clone un projet à jour n'a
+// rien à synchroniser mais rien d'installé, et l'échec d'installation est « signalé, non bloquant » :
+// ce signal doit donc revenir à chaque session. Lecture seule de `installed_plugins.json`, SANS lancer
+// de processus (budget du hook). Muet en session cloud (`CLAUDE_CODE_REMOTE=true`, pas de poste à
+// équiper), sans mod, ou sur toute erreur de lecture — jamais de faux positif.
+try {
+  const racineMods = racineDepot(cwd);
+  if (racineMods && process.env.CLAUDE_CODE_REMOTE !== 'true') {
+    const vendore = existsSync(join(racineMods, '.claude', 'workflow', 'manifest.json'));
+    const dossierMods = vendore
+      ? join(racineMods, '.claude', 'workflow', 'mods')
+      : join(racineMods, 'plugin', 'mods');
+    const attendus = [];
+    if (existsSync(dossierMods)) {
+      for (const nom of readdirSync(dossierMods)) {
+        const cheminPlugin = join(dossierMods, nom, '.claude-plugin', 'plugin.json');
+        if (existsSync(cheminPlugin)) {
+          attendus.push({ nom, version: JSON.parse(readFileSync(cheminPlugin, 'utf8')).version });
+        }
+      }
+    }
+    if (attendus.length) {
+      const config = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+      const plugins = JSON.parse(readFileSync(join(config, 'plugins', 'installed_plugins.json'), 'utf8')).plugins || {};
+      const norm = (p) => resolve(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+      const manquants = attendus.filter(({ nom, version }) => !Object.entries(plugins).some(
+        ([cle, liste]) => cle.startsWith(`${nom}@`) && Array.isArray(liste) && liste.some(
+          (x) => x.scope === 'local' && x.projectPath && norm(x.projectPath) === norm(racineMods) && x.version === version,
+        ),
+      ));
+      if (manquants.length) {
+        lignes.push(
+          `**Mods non installés ou en retard** (${manquants.map((m) => m.nom).join(', ')}) — ` +
+          `\`node ${vendore ? '.claude/workflow/bin' : 'plugin/bin'}/installer-mods.mjs\``
+        );
+      }
+    }
+  }
+} catch { /* fichier absent, illisible ou JSON invalide : contrôle désactivé, jamais de faux positif */ }
+
+// Dépôt sous un dossier synchronisé (Synology Drive, OneDrive, Dropbox, iCloud) : le client ne
+// synchronise qu'au fichier près, jamais `.git` en bloc — une reprise en cours d'écriture git
+// corrompt l'objet (torrent-uploader, 2026-09-11). Et une exclusion ne suffit pas : Synology Drive
+// (comme OneDrive à la demande) filtre tout accès sous son arborescence, contenu exclu compris —
+// Vite n'y démarre jamais (torrent-uploader, 2026-09-16/17). Le remède est de déplacer le dépôt ;
+// le témoin dit qu'on a choisi de rester en connaissance de cause. Sans lui, rappel à chaque session.
+try {
+  const racine = racineDepot(cwd);
+  if (racine && /SynologyDrive|OneDrive|Dropbox|iCloud/i.test(racine)) {
+    const cheminGit = join(racine, '.git');
+    const gitEstUnDossier = existsSync(cheminGit) && statSync(cheminGit).isDirectory();
+    if (gitEstUnDossier && !existsSync(join(cheminGit, 'info', 'synchro-exclue'))) {
+      lignes.push(
+        '**Dépôt sous un dossier synchronisé** : le déplacer hors de l\'arborescence du client ' +
+        "(une exclusion ne retire pas le filtre du client : `.git` corrompu le 2026-09-11, Vite " +
+        'bloqué le 2026-09-16, torrent-uploader). Rester là en connaissance de cause → poser le ' +
+        'témoin `.git/info/synchro-exclue`.'
+      );
+    }
+  }
+} catch { /* détection best-effort : jamais bloquante */ }
+
+const blocs = [];
+if (claudeBase) blocs.push(claudeBase);
+if (lignes.length > 0) {
+  blocs.push(`État du contexte projet (hook workflow) :\n- ${lignes.join('\n- ')}`);
+}
+
+// Reprise sans dérive à signaler : rien à dire, on n'écrit pas.
+if (blocs.length === 0) riendafaire();
+
+repondre({
+  hookSpecificOutput: {
+    hookEventName: 'SessionStart',
+    additionalContext: blocs.join('\n\n'),
+  },
+  ...(lignesVersion.length ? { systemMessage: lignesVersion.join('\n') } : {}),
+});
