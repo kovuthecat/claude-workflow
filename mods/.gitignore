@@ -1,0 +1,3 @@
+# Marketplace générée par installer-mods.mjs (dépend du poste) — ancrée : sans la barre initiale,
+# elle ignorerait aussi le .claude-plugin/plugin.json de chaque mod.
+/.claude-plugin/
