@@ -1,0 +1,9 @@
+{
+  "name": "affichage",
+  "version": "0.69.1",
+  "description": "Affichage du workflow : bandeau au-dessus du prompt (plan, limites 5 h / 7 j) ; titre de session Projet - Plan - Session.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "templates"
+  }
+}
